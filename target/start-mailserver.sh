@@ -33,7 +33,8 @@ DEFAULT_VARS["SPOOF_PROTECTION"]="${SPOOF_PROTECTION:="0"}"
 DEFAULT_VARS["TLS_LEVEL"]="${TLS_LEVEL:="modern"}"
 DEFAULT_VARS["ENABLE_SRS"]="${ENABLE_SRS:="0"}"
 DEFAULT_VARS["REPORT_RECIPIENT"]="${REPORT_RECIPIENT:="0"}"
-DEFAULT_VARS["REPORT_INTERVAL"]="${REPORT_INTERVAL:="daily"}"
+DEFAULT_VARS["LOGROTATE_INTERVAL"]="${LOGROTATE_INTERVAL:=${REPORT_INTERVAL:-"daily"}}"
+DEFAULT_VARS["LOGWATCH_INTERVAL"]="${LOGWATCH_INTERVAL:="none"}"
 DEFAULT_VARS["VIRUSMAILS_DELETE_DELAY"]="${VIRUSMAILS_DELETE_DELAY:="7"}"
 
 ##########################################################################
@@ -49,6 +50,7 @@ DEFAULT_VARS["VIRUSMAILS_DELETE_DELAY"]="${VIRUSMAILS_DELETE_DELAY:="7"}"
 ##########################################################################
 HOSTNAME="$(hostname -f)"
 DOMAINNAME="$(hostname -d)"
+CHKSUM_FILE=/tmp/docker-mailserver-config-chksum
 ##########################################################################
 # << GLOBAL VARS
 ##########################################################################
@@ -95,6 +97,7 @@ function register_functions() {
 
 	if [ "$SMTP_ONLY" != 1 ]; then
 		_register_setup_function "_setup_dovecot"
+                _register_setup_function "_setup_dovecot_dhparam"
 		_register_setup_function "_setup_dovecot_local_user"
 	fi
 
@@ -120,8 +123,8 @@ function register_functions() {
 	_register_setup_function "_setup_postfix_hostname"
 	_register_setup_function "_setup_dovecot_hostname"
 
+	_register_setup_function "_setup_postfix_smtputf8"
 	_register_setup_function "_setup_postfix_sasl"
-	_register_setup_function "_setup_postfix_override_configuration"
 	_register_setup_function "_setup_postfix_sasl_password"
 	_register_setup_function "_setup_security_stack"
 	_register_setup_function "_setup_postfix_aliases"
@@ -157,12 +160,22 @@ function register_functions() {
 		_register_setup_function "_setup_postfix_virtual_transport"
 	fi
 
+	_register_setup_function "_setup_postfix_override_configuration"
+
   _register_setup_function "_setup_environment"
   _register_setup_function "_setup_logrotate"
 
-  if [ "$REPORT_RECIPIENT" != 0 ]; then
-  	_register_setup_function "_setup_mail_summary"
-  fi
+	if [ "$PFLOGSUMM_TRIGGER" != "none" ]; then
+		_register_setup_function "_setup_mail_summary"
+	fi
+
+	if [ "$LOGWATCH_TRIGGER" != "none" ]; then
+		_register_setup_function "_setup_logwatch"
+	fi
+
+
+        # Compute last as the config files are modified in-place
+        _register_setup_function "_setup_chksum_file"
 
 	################### << setup funcs
 
@@ -171,7 +184,10 @@ function register_functions() {
 	_register_fix_function "_fix_var_mail_permissions"
 	_register_fix_function "_fix_var_amavis_permissions"
 	if [ "$ENABLE_CLAMAV" = 0 ]; then
-        _register_fix_function "_fix_cleanup_clamav"
+        	_register_fix_function "_fix_cleanup_clamav"
+	fi
+	if [ "$ENABLE_SPAMASSASSIN" = 0 ]; then
+		_register_fix_function "_fix_cleanup_spamassassin"
 	fi
 
 	################### << fix funcs
@@ -428,14 +444,56 @@ function _setup_default_vars() {
 
 	# update POSTMASTER_ADDRESS - must be done done after _check_hostname()
 	DEFAULT_VARS["POSTMASTER_ADDRESS"]="${POSTMASTER_ADDRESS:=postmaster@${DOMAINNAME}}"
-    # update REPORT_SENDER - must be done done after _check_hostname()
-    DEFAULT_VARS["REPORT_SENDER"]="${REPORT_SENDER:=mailserver-report@${HOSTNAME}}"
+
+	# update REPORT_SENDER - must be done done after _check_hostname()
+	DEFAULT_VARS["REPORT_SENDER"]="${REPORT_SENDER:=mailserver-report@${HOSTNAME}}"
+	DEFAULT_VARS["PFLOGSUMM_SENDER"]="${PFLOGSUMM_SENDER:=${REPORT_SENDER}}"
+
+	# set PFLOGSUMM_TRIGGER here for backwards compatibility
+	# when REPORT_RECIPIENT is on the old method should be used
+	if [ "$REPORT_RECIPIENT" == "0" ]; then
+		DEFAULT_VARS["PFLOGSUMM_TRIGGER"]="${PFLOGSUMM_TRIGGER:="none"}"
+	else
+		DEFAULT_VARS["PFLOGSUMM_TRIGGER"]="${PFLOGSUMM_TRIGGER:="logrotate"}"
+	fi
+
+	# Expand address to simplify the rest of the script
+	if [ "$REPORT_RECIPIENT" == "0" ] || [ "$REPORT_RECIPIENT" == "1" ]; then
+		REPORT_RECIPIENT="$POSTMASTER_ADDRESS"
+		DEFAULT_VARS["REPORT_RECIPIENT"]="${REPORT_RECIPIENT}"
+	fi
+	DEFAULT_VARS["PFLOGSUMM_RECIPIENT"]="${PFLOGSUMM_RECIPIENT:=${REPORT_RECIPIENT}}"
+	DEFAULT_VARS["LOGWATCH_RECIPIENT"]="${LOGWATCH_RECIPIENT:=${REPORT_RECIPIENT}}"
 
 	for var in ${!DEFAULT_VARS[@]}; do
 		echo "export $var=\"${DEFAULT_VARS[$var]}\"" >> /root/.bashrc
 		[ $? != 0 ] && notify 'err' "Unable to set $var=${DEFAULT_VARS[$var]}" && kill -15 `cat /var/run/supervisord.pid` && return 1
 		notify 'inf' "Set $var=${DEFAULT_VARS[$var]}"
 	done
+}
+
+function _setup_chksum_file() {
+        notify 'task' "Setting up configuration checksum file"
+
+
+        if [ -d /tmp/docker-mailserver ]; then
+          pushd /tmp/docker-mailserver
+
+          declare -a cf_files=()
+          for file in postfix-accounts.cf postfix-virtual.cf postfix-aliases.cf; do
+            [ -f "$file" ] && cf_files+=("$file")
+          done
+
+          notify 'inf' "Creating $CHKSUM_FILE"
+          sha512sum ${cf_files[@]/#/--tag } >$CHKSUM_FILE
+
+          popd
+        else
+          # We could just skip the file, but perhaps config can be added later?
+          # If so it must be processed by the check for changes script
+          notify 'inf' "Creating empty $CHKSUM_FILE (no config)"
+          touch $CHKSUM_FILE
+        fi
 }
 
 function _setup_mailname() {
@@ -477,6 +535,25 @@ function _setup_dovecot_hostname() {
 
 function _setup_dovecot() {
 	notify 'task' 'Setting up Dovecot'
+
+        # Moved from docker file, copy or generate default self-signed cert
+        if [ -f /var/mail-state/lib-dovecot/dovecot.pem -a "$ONE_DIR" = 1 ]; then
+                notify 'inf' "Copying default dovecot cert"
+                cp /var/mail-state/lib-dovecot/dovecot.key /etc/dovecot/ssl/
+                cp /var/mail-state/lib-dovecot/dovecot.pem /etc/dovecot/ssl/
+        fi
+        if [ ! -f /etc/dovecot/ssl/dovecot.pem ]; then
+                notify 'inf' "Generating default dovecot cert"
+                pushd /usr/share/dovecot
+                ./mkcert.sh
+                popd
+
+                if [ "$ONE_DIR" = 1 ];then
+                        mkdir -p /var/mail-state/lib-dovecot
+                        cp /etc/dovecot/ssl/dovecot.key /var/mail-state/lib-dovecot/
+                        cp /etc/dovecot/ssl/dovecot.pem /var/mail-state/lib-dovecot/
+                fi
+        fi
 
 	cp -a /usr/share/dovecot/protocols.d /etc/dovecot/
 	# Disable pop3 (it will be eventually enabled later in the script, if requested)
@@ -573,7 +650,7 @@ function _setup_dovecot_local_user() {
 
 	if [[ ! $(grep '@' /tmp/docker-mailserver/postfix-accounts.cf | grep '|') ]]; then
 		if [ $ENABLE_LDAP -eq 0 ]; then
-			notify 'fatal' "Unless using LDAP, you need at least 1 email account to start the server."
+			notify 'fatal' "Unless using LDAP, you need at least 1 email account to start Dovecot."
 			defunc
 		fi
 	fi
@@ -672,6 +749,11 @@ function _setup_postfix_sizelimits() {
 	postconf -e "message_size_limit = ${DEFAULT_VARS["POSTFIX_MESSAGE_SIZE_LIMIT"]}"
 	notify 'inf' "Configuring postfix mailbox size limit"
 	postconf -e "mailbox_size_limit = ${DEFAULT_VARS["POSTFIX_MAILBOX_SIZE_LIMIT"]}"
+}
+
+function _setup_postfix_smtputf8() {
+        notify 'inf' "Configuring postfix smtputf8 support (disable)"
+        postconf -e "smtputf8_enable = no"
 }
 
 function _setup_spoof_protection () {
@@ -821,6 +903,12 @@ function _setup_dkim() {
 		local _f_keytable="/etc/opendkim/KeyTable"
 		[ ! -f "$_f_keytable" ] && touch "$_f_keytable"
 	fi
+
+	# Setup nameservers paramater from /etc/resolv.conf if not defined
+	if ! grep '^Nameservers' /etc/opendkim.conf; then
+		echo "Nameservers $(grep '^nameserver' /etc/resolv.conf | awk -F " " '{print $2}' | paste -sd ',' -)" >> /etc/opendkim.conf
+		notify 'inf' "Nameservers added to /etc/opendkim.conf"
+	fi
 }
 
 function _setup_ssl() {
@@ -835,8 +923,8 @@ function _setup_ssl() {
       sed -i -r 's/^smtp_tls_protocols =.*$/smtp_tls_protocols = !SSLv2,!SSLv3,!TLSv1,!TLSv1.1/' /etc/postfix/main.cf
       sed -i -r 's/^tls_high_cipherlist =.*$/tls_high_cipherlist = ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256/' /etc/postfix/main.cf
 
-      # Dovecot configuration
-      sed -i -r 's/^ssl_protocols =.*$/ssl_protocols = !SSLv3,!TLSv1,!TLSv1.1/' /etc/dovecot/conf.d/10-ssl.conf
+      # Dovecot configuration (secure by default though)
+      sed -i -r 's/^ssl_min_protocol =.*$/ssl_min_protocol = TLSv1.2/' /etc/dovecot/conf.d/10-ssl.conf
       sed -i -r 's/^ssl_cipher_list =.*$/ssl_cipher_list = ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256/' /etc/dovecot/conf.d/10-ssl.conf
 
       notify 'inf' "TLS configured with 'modern' ciphers"
@@ -849,7 +937,7 @@ function _setup_ssl() {
       sed -i -r 's/^tls_high_cipherlist =.*$/tls_high_cipherlist = ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS/' /etc/postfix/main.cf
 
       # Dovecot configuration
-      sed -i -r 's/^ssl_protocols = .*$/ssl_protocols = !SSLv3/' /etc/dovecot/conf.d/10-ssl.conf
+      sed -i -r 's/^ssl_min_protocol = .*$/ssl_min_protocol = TLSv1/' /etc/dovecot/conf.d/10-ssl.conf
       sed -i -r 's/^ssl_cipher_list = .*$/ssl_cipher_list = ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS/' /etc/dovecot/conf.d/10-ssl.conf
 
       notify 'inf' "TLS configured with 'intermediate' ciphers"
@@ -968,7 +1056,6 @@ function _setup_ssl() {
         ;;
     * )
         # Unknown option, default behavior, no action is required
-
         notify 'warn' "SSL configured by default"
         ;;
 	esac
@@ -987,6 +1074,7 @@ function _setup_docker_permit() {
 
 	container_ip=$(ip addr show eth0 | grep 'inet ' | sed 's/[^0-9\.\/]*//g' | cut -d '/' -f 1)
 	container_network="$(echo $container_ip | cut -d '.' -f1-2).0.0"
+	container_networks=$(ip -o -4 addr show type veth | egrep -o '[0-9\.]+/[0-9]+')
 
 	case $PERMIT_DOCKER in
 		"host" )
@@ -1002,7 +1090,15 @@ function _setup_docker_permit() {
 			echo 172.16.0.0/12 >> /etc/opendmarc/ignore.hosts
 			echo 172.16.0.0/12 >> /etc/opendkim/TrustedHosts
 			;;
-
+		"connected-networks" )
+			for network in $container_networks; do
+				network=$(_sanitize_ipv4_to_subnet_cidr $network)
+				notify 'inf' "Adding docker network $network in my networks"
+				postconf -e "$(postconf | grep '^mynetworks =') $network"
+				echo $network >> /etc/opendmarc/ignore.hosts
+				echo $network >> /etc/opendkim/TrustedHosts
+			done
+			;;
 		* )
 			notify 'inf' "Adding container ip in my networks"
 			postconf -e "$(postconf | grep '^mynetworks =') $container_ip/32"
@@ -1038,7 +1134,7 @@ function _setup_postfix_override_configuration() {
 	fi
 	if [ -f /tmp/docker-mailserver/postfix-master.cf ]; then
 		while read line; do
-		if [[ "$line" =~ ^[a-z] ]]; then
+		if [[ "$line" =~ ^[0-9a-z] ]]; then
 			postconf -P "$line"
 		fi
 		done < /tmp/docker-mailserver/postfix-master.cf
@@ -1180,20 +1276,65 @@ function _setup_postfix_relay_hosts() {
 function _setup_postfix_dhparam() {
 	notify 'task' 'Setting up Postfix dhparam'
 	if [ "$ONE_DIR" = 1 ];then
-		DHPARAMS_FILE=/var/mail-state/lib-postfix/dhparams.pem
+		DHPARAMS_FILE=/var/mail-state/lib-shared/dhparams.pem
 		if [ ! -f $DHPARAMS_FILE ]; then
-			notify 'inf' "Generate new dhparams for postfix"
+			notify 'inf' "Generate new shared dhparams (postfix)"
 			mkdir -p $(dirname "$DHPARAMS_FILE")
 			openssl dhparam -out $DHPARAMS_FILE 2048
 		else
-			notify 'inf' "Use dhparams that was generated previously"
+			notify 'inf' "Use postfix dhparams that was generated previously"
 		fi
 
-		# Copy from the state directpry to the working location
-		rm /etc/postfix/dhparams.pem && cp $DHPARAMS_FILE /etc/postfix/dhparams.pem
+		# Copy from the state directory to the working location
+		rm -f /etc/postfix/dhparams.pem && cp $DHPARAMS_FILE /etc/postfix/dhparams.pem
 	else
-		notify 'inf' "No state dir, we use the dhparams generated on image creation"
+                if [ ! -f /etc/postfix/dhparams.pem ]; then
+                        if [ -f /etc/dovecot/dh.pem ]; then
+                                notify 'inf' "Copy dovecot dhparams to postfix"
+                                cp /etc/dovecot/dh.pem /etc/postfix/dhparams.pem
+                        elif [ -f /tmp/docker-mailserver/dhparams.pem ]; then
+                                notify 'inf' "Copy pre-generated dhparams to postfix"
+                                cp /tmp/docker-mailserver/dhparams.pem /etc/postfix/dhparams.pem
+                        else
+                                notify 'inf' "Generate new dhparams for postfix"
+                                openssl dhparam -out /etc/postfix/dhparams.pem 2048
+                        fi
+                else
+                        notify 'inf' "Use existing postfix dhparams"
+                fi
 	fi
+}
+
+function _setup_dovecot_dhparam() {
+        notify 'task' 'Setting up Dovecot dhparam'
+        if [ "$ONE_DIR" = 1 ];then
+                DHPARAMS_FILE=/var/mail-state/lib-shared/dhparams.pem
+                if [ ! -f $DHPARAMS_FILE ]; then
+                        notify 'inf' "Generate new shared dhparams (dovecot)"
+                        mkdir -p $(dirname "$DHPARAMS_FILE")
+                        openssl dhparam -out $DHPARAMS_FILE 2048
+                else
+                        notify 'inf' "Use dovecot dhparams that was generated previously"
+                fi
+
+                # Copy from the state directory to the working location
+                rm -f /etc/dovecot/dh.pem && cp $DHPARAMS_FILE /etc/dovecot/dh.pem
+        else
+                if [ ! -f /etc/dovecot/dh.pem ]; then
+                        if [ -f /etc/postfix/dhparams.pem ]; then
+                                notify 'inf' "Copy postfix dhparams to dovecot"
+                                cp /etc/postfix/dhparams.pem /etc/dovecot/dh.pem
+                        elif [ -f /tmp/docker-mailserver/dhparams.pem ]; then
+                                notify 'inf' "Copy pre-generated dhparams to dovecot"
+                                cp /tmp/docker-mailserver/dhparams.pem /etc/dovecot/dh.pem
+                        else
+                                notify 'inf' "Generate new dhparams for dovecot"
+                                openssl dhparam -out /etc/dovecot/dh.pem 2048
+                        fi
+                else
+                        notify 'inf' "Use existing dovecot dhparams"
+                fi
+        fi
 }
 
 function _setup_security_stack() {
@@ -1268,17 +1409,17 @@ function _setup_logrotate() {
 	notify 'inf' "Setting up logrotate"
 
 	LOGROTATE="/var/log/mail/mail.log\n{\n  compress\n  copytruncate\n  delaycompress\n"
-	case "$REPORT_INTERVAL" in
+	case "$LOGROTATE_INTERVAL" in
 		"daily" )
-			notify 'inf' "Setting postfix summary interval to daily"
+			notify 'inf' "Setting postfix logrotate interval to daily"
 			LOGROTATE="$LOGROTATE  rotate 1\n  daily\n"
 			;;
 		"weekly" )
-			notify 'inf' "Setting postfix summary interval to weekly"
+			notify 'inf' "Setting postfix logrotate interval to weekly"
 			LOGROTATE="$LOGROTATE  rotate 1\n  weekly\n"
 			;;
 		"monthly" )
-			notify 'inf' "Setting postfix summary interval to monthly"
+			notify 'inf' "Setting postfix logrotate interval to monthly"
 			LOGROTATE="$LOGROTATE  rotate 1\n  monthly\n"
 			;;
 	esac
@@ -1287,10 +1428,41 @@ function _setup_logrotate() {
 }
 
 function _setup_mail_summary() {
-	notify 'inf' "Enable postfix summary with recipient $REPORT_RECIPIENT"
-	[ "$REPORT_RECIPIENT" = 1 ] && REPORT_RECIPIENT=$POSTMASTER_ADDRESS
-	sed -i "s|}|  postrotate\n    /usr/local/bin/postfix-summary $HOSTNAME \
-    $REPORT_RECIPIENT $REPORT_SENDER\n  endscript\n}\n|" /etc/logrotate.d/maillog
+	notify 'inf' "Enable postfix summary with recipient $PFLOGSUMM_RECIPIENT"
+        case "$PFLOGSUMM_TRIGGER" in
+                "daily_cron" )
+                        notify 'inf' "Creating daily cron job for pflogsumm report"
+			echo "#!/bin/bash" > /etc/cron.daily/postfix-summary
+			echo "/usr/local/bin/report-pflogsumm-yesterday $HOSTNAME $PFLOGSUMM_RECIPIENT $PFLOGSUMM_SENDER" \
+			 >> /etc/cron.daily/postfix-summary
+			chmod +x /etc/cron.daily/postfix-summary
+                        ;;
+                "logrotate" )
+                        notify 'inf' "Add postrotate action for pflogsumm report"
+			sed -i "s|}|  postrotate\n    /usr/local/bin/postfix-summary $HOSTNAME \
+    $PFLOGSUMM_RECIPIENT $PFLOGSUMM_SENDER\n  endscript\n}\n|" /etc/logrotate.d/maillog
+                        ;;
+        esac
+}
+
+function _setup_logwatch() {
+	notify 'inf' "Enable logwatch reports with recipient $LOGWATCH_RECIPIENT"
+	case "$LOGWATCH_INTERVAL" in
+		"daily" )
+			notify 'inf' "Creating daily cron job for logwatch reports"
+			echo "#!/bin/bash" > /etc/cron.daily/logwatch
+			echo "/usr/sbin/logwatch --range Yesterday --hostname $HOSTNAME --mailto $LOGWATCH_RECIPIENT" \
+			>> /etc/cron.daily/logwatch
+			chmod 744 /etc/cron.daily/logwatch
+			;;
+		"weekly" )
+			notify 'inf' "Creating weekly cron job for logwatch reports"
+			echo "#!/bin/bash" > /etc/cron.weekly/logwatch
+			echo "/usr/sbin/logwatch --range 'between -7 days and -1 days' --hostname $HOSTNAME --mailto $LOGWATCH_RECIPIENT" \
+			>> /etc/cron.weekly/logwatch
+			chmod 744 /etc/cron.weekly/logwatch
+			;;
+	esac
 }
 
 function _setup_environment() {
@@ -1364,7 +1536,12 @@ function _fix_var_amavis_permissions() {
 function _fix_cleanup_clamav() {
     notify 'task' 'Cleaning up disabled Clamav'
     rm -f /etc/logrotate.d/clamav-*
-    rm -f /etc/cron.d/freshclam
+    rm -f /etc/cron.d/clamav-freshclam
+}
+
+function _fix_cleanup_spamassassin() {
+    notify 'task' 'Cleaning up disabled spamassassin'
+    rm -f /etc/cron.daily/spamassassin
 }
 
 ##########################################################################
@@ -1548,6 +1725,8 @@ function _start_changedetector() {
 # !  CARE --> DON'T CHANGE, unless you exactly know what you are doing
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # >>
+
+. /usr/local/bin/helper_functions.sh
 
 if [[ ${DEFAULT_VARS["DMS_DEBUG"]} == 1 ]]; then
 notify 'taskgrp' ""

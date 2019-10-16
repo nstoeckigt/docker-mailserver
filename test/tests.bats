@@ -1,16 +1,34 @@
 load 'test_helper/bats-support/load'
 load 'test_helper/bats-assert/load'
+
+
+#
+# shared functions
+#
+
+function wait_for_service() {
+  containerName=$1
+  serviceName=$2
+  count=0
+  while ! (docker exec $containerName /usr/bin/supervisorctl status $serviceName | grep RUNNING >/dev/null)
+  do
+    ((count++)) && ((count==30)) && break
+    sleep 5
+  done
+  return $(docker exec $containerName /usr/bin/supervisorctl status $serviceName | grep RUNNING >/dev/null)
+}
+
+function count_processed_changes() {
+  containerName=$1
+  docker exec $containerName cat /var/log/supervisor/changedetector.log | grep "Update checksum" | wc -l
+}
+
 #
 # configuration checks
 #
 
 @test "checking configuration: hostname/domainname" {
   run docker run `docker inspect --format '{{ .Config.Image }}' mail`
-  assert_success
-}
-
-@test "checking configuration: hostname/domainname override" {
-  run docker exec mail_smtponly /bin/bash -c "cat /etc/mailname | grep my-domain.com"
   assert_success
 }
 
@@ -86,106 +104,15 @@ load 'test_helper/bats-assert/load'
   assert_failure
 }
 
-@test "checking process: fail2ban (fail2ban server enabled)" {
-  run docker exec mail_fail2ban /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/bin/python3 /usr/bin/fail2ban-server'"
-  assert_success
-}
-
 @test "checking process: fetchmail (disabled in default configuration)" {
   run docker exec mail /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/bin/fetchmail'"
   assert_failure
-}
-
-@test "checking process: fetchmail (fetchmail server enabled)" {
-  run docker exec mail_fetchmail /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/bin/fetchmail'"
-  assert_success
 }
 
 @test "checking process: clamav (clamav disabled by ENABLED_CLAMAV=0)" {
   run docker exec mail_disabled_clamav_spamassassin /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/sbin/clamd'"
   assert_failure
 }
-
-@test "checking process: saslauthd (saslauthd server enabled)" {
-  run docker exec mail_with_ldap /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/sbin/saslauthd'"
-  assert_success
-}
-
-
-#
-# postgrey
-#
-
-@test "checking process: postgrey (disabled in default configuration)" {
-  run docker exec mail /bin/bash -c "ps aux --forest | grep -v grep | grep 'postgrey'"
-  assert_failure
-}
-
-@test "checking postgrey: /etc/postfix/main.cf correctly edited" {
-  run docker exec mail_with_postgrey /bin/bash -c "grep 'bl.spamcop.net, check_policy_service inet:127.0.0.1:10023' /etc/postfix/main.cf | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking postgrey: /etc/default/postgrey correctly edited and has the default values" {
-  run docker exec mail_with_postgrey /bin/bash -c "grep '^POSTGREY_OPTS=\"--inet=127.0.0.1:10023 --delay=15 --max-age=35 --auto-whitelist-clients=5\"$' /etc/default/postgrey | wc -l"
-  assert_success
-  assert_output 1
-  run docker exec mail_with_postgrey /bin/bash -c "grep '^POSTGREY_TEXT=\"Delayed by postgrey\"$' /etc/default/postgrey | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking process: postgrey (postgrey server enabled)" {
-  run docker exec mail_with_postgrey /bin/bash -c "ps aux --forest | grep -v grep | grep 'postgrey'"
-  assert_success
-}
-
-@test "checking postgrey: there should be a log entry about a new greylisted e-mail user@external.tld in /var/log/mail/mail.log" {
-  #editing the postfix config in order to ensure that postgrey handles the test e-mail. The other spam checks at smtpd_recipient_restrictions would interfere with it.
-  run docker exec mail_with_postgrey /bin/sh -c "sed -ie 's/permit_sasl_authenticated.*policyd-spf,$//g' /etc/postfix/main.cf"
-  run docker exec mail_with_postgrey /bin/sh -c "sed -ie 's/reject_unauth_pipelining.*reject_unknown_recipient_domain,$//g' /etc/postfix/main.cf"
-  run docker exec mail_with_postgrey /bin/sh -c "sed -ie 's/reject_rbl_client.*inet:127\.0\.0\.1:10023$//g' /etc/postfix/main.cf"
-  run docker exec mail_with_postgrey /bin/sh -c "sed -ie 's/smtpd_recipient_restrictions =/smtpd_recipient_restrictions = check_policy_service inet:127.0.0.1:10023/g' /etc/postfix/main.cf"
-
-  run docker exec mail_with_postgrey /bin/sh -c "/etc/init.d/postfix reload"
-  run docker exec mail_with_postgrey /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/email-templates/postgrey.txt"
-  sleep 5 #ensure that the information has been written into the log
-  run docker exec mail_with_postgrey /bin/bash -c "grep -i 'action=greylist.*user@external\.tld' /var/log/mail/mail.log | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking postgrey: there should be a log entry about the retried and passed e-mail user@external.tld in /var/log/mail/mail.log" {
-  sleep 20 #wait 20 seconds so that postgrey would accept the message
-  run docker exec mail_with_postgrey /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/email-templates/postgrey.txt"
-  sleep 8
-  run docker exec mail_with_postgrey /bin/sh -c "grep -i 'action=pass, reason=triplet found.*user@external\.tld' /var/log/mail/mail.log | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking postgrey: there should be a log entry about the whitelisted and passed e-mail user@whitelist.tld in /var/log/mail/mail.log" {
-  run docker exec mail_with_postgrey /bin/sh -c "nc -w 8 0.0.0.0 10023 < /tmp/docker-mailserver-test/nc_templates/postgrey_whitelist.txt"
-  run docker exec mail_with_postgrey /bin/sh -c "grep -i 'action=pass, reason=client whitelist' /var/log/mail/mail.log | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking postgrey: there should be a log entry about the whitelisted local and passed e-mail user@whitelistlocal.tld in /var/log/mail/mail.log" {
-  run docker exec mail_with_postgrey /bin/sh -c "nc -w 8 0.0.0.0 10023 < /tmp/docker-mailserver-test/nc_templates/postgrey_whitelist_local.txt"
-  run docker exec mail_with_postgrey /bin/sh -c "grep -i 'action=pass, reason=client whitelist' /var/log/mail/mail.log | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking postgrey: there should be a log entry about the whitelisted recipient user2@otherdomain.tld in /var/log/mail/mail.log" {
-  run docker exec mail_with_postgrey /bin/sh -c "nc -w 8 0.0.0.0 10023 < /tmp/docker-mailserver-test/nc_templates/postgrey_whitelist_recipients.txt"
-  run docker exec mail_with_postgrey /bin/sh -c "grep -i 'action=pass, reason=recipient whitelist' /var/log/mail/mail.log | wc -l"
-  assert_success
-  assert_output 1
-}
-
 
 #
 # imap
@@ -194,11 +121,6 @@ load 'test_helper/bats-assert/load'
 @test "checking process: dovecot imaplogin (enabled in default configuration)" {
   run docker exec mail /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/sbin/dovecot'"
   assert_success
-}
-
-@test "checking process: dovecot imaplogin (disabled using SMTP_ONLY)" {
-  run docker exec mail_smtponly /bin/bash -c "ps aux --forest | grep -v grep | grep '/usr/sbin/dovecot'"
-  assert_failure
 }
 
 @test "checking imap: server is ready with STARTTLS" {
@@ -213,25 +135,6 @@ load 'test_helper/bats-assert/load'
 
 @test "checking imap: added user authentication works" {
   run docker exec mail /bin/sh -c "nc -w 1 0.0.0.0 143 < /tmp/docker-mailserver-test/auth/added-imap-auth.txt"
-  assert_success
-}
-
-#
-# pop
-#
-
-@test "checking pop: server is ready" {
-  run docker exec mail_pop3 /bin/bash -c "nc -w 1 0.0.0.0 110 | grep '+OK'"
-  assert_success
-}
-
-@test "checking pop: authentication works" {
-  run docker exec mail_pop3 /bin/sh -c "nc -w 1 0.0.0.0 110 < /tmp/docker-mailserver-test/auth/pop3-auth.txt"
-  assert_success
-}
-
-@test "checking pop: added user authentication works" {
-  run docker exec mail_pop3 /bin/sh -c "nc -w 1 0.0.0.0 110 < /tmp/docker-mailserver-test/auth/added-pop3-auth.txt"
   assert_success
 }
 
@@ -371,15 +274,12 @@ load 'test_helper/bats-assert/load'
   assert_output 1
 }
 
-@test "checking smtp_only: mail send should work" {
-  run docker exec mail_smtponly /bin/sh -c "postconf -e smtp_host_lookup=no"
+@test "checking smtp: not advertising smtputf8" {
+  # Dovecot does not support SMTPUTF8, so while we can send we cannot receive
+  # Better disable SMTPUTF8 support entirely if we can't handle it correctly
+  run docker exec mail /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/email-templates/smtp-ehlo.txt | grep SMTPUTF8 | wc -l"
   assert_success
-  run docker exec mail_smtponly /bin/sh -c "/etc/init.d/postfix reload"
-  assert_success
-  run docker exec mail_smtponly /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/email-templates/smtp-only.txt"
-  assert_success
-  run docker exec mail_smtponly /bin/sh -c 'grep -cE "to=<user2\@external.tld>.*status\=sent" /var/log/mail/mail.log'
-  [ "$status" -ge 0 ]
+  assert_output 0
 }
 
 #
@@ -467,30 +367,6 @@ load 'test_helper/bats-assert/load'
   assert_success
 }
 
-@test "checking spamassassin: docker env variables are set correctly (default)" {
-  run docker exec mail_pop3 /bin/sh -c "grep '\$sa_tag_level_deflt' /etc/amavis/conf.d/20-debian_defaults | grep '= 2.0'"
-  assert_success
-  run docker exec mail_pop3 /bin/sh -c "grep '\$sa_tag2_level_deflt' /etc/amavis/conf.d/20-debian_defaults | grep '= 6.31'"
-  assert_success
-  run docker exec mail_pop3 /bin/sh -c "grep '\$sa_kill_level_deflt' /etc/amavis/conf.d/20-debian_defaults | grep '= 6.31'"
-  assert_success
-  run docker exec mail_pop3 /bin/sh -c "grep '\$sa_spam_subject_tag' /etc/amavis/conf.d/20-debian_defaults | grep '= .\*\*\*SPAM\*\*\* .'"
-  assert_success
-}
-
-@test "checking spamassassin: docker env variables are set correctly (custom)" {
-  run docker exec mail /bin/sh -c "grep '\$sa_tag_level_deflt' /etc/amavis/conf.d/20-debian_defaults | grep '= -5.0'"
-  assert_success
-  run docker exec mail /bin/sh -c "grep '\$sa_tag2_level_deflt' /etc/amavis/conf.d/20-debian_defaults | grep '= 2.0'"
-  assert_success
-  run docker exec mail /bin/sh -c "grep '\$sa_kill_level_deflt' /etc/amavis/conf.d/20-debian_defaults | grep '= 3.0'"
-  assert_success
-  run docker exec mail /bin/sh -c "grep '\$sa_spam_subject_tag' /etc/amavis/conf.d/20-debian_defaults | grep '= .SPAM: .'"
-  assert_success
-  run docker exec mail_undef_spam_subject /bin/sh -c "grep '\$sa_spam_subject_tag' /etc/amavis/conf.d/20-debian_defaults | grep '= undef'"
-  assert_success
-}
-
 @test "checking spamassassin: all registered domains should see spam headers" {
   run docker exec mail /bin/sh -c "grep -ir 'X-Spam-' /var/mail/localhost.localdomain/user1/new"
   assert_success
@@ -538,6 +414,11 @@ load 'test_helper/bats-assert/load'
   run docker exec mail /bin/sh -c "ls -l /etc/opendkim/keys/ | grep '^d' | wc -l"
   assert_success
   assert_output 2
+}
+
+@test "checking opendkim: /etc/opendkim.conf contains nameservers copied from /etc/resolv.conf" {
+  run docker exec mail /bin/bash -c "grep -E '^Nameservers ((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)' /etc/opendkim.conf"
+  assert_success
 }
 
 
@@ -634,7 +515,7 @@ load 'test_helper/bats-assert/load'
   # Check presence of tables and TrustedHosts
   run docker run --rm \
     -v "$(pwd)/test/config/empty/opendkim":/etc/opendkim \
-    `docker inspect --format '{{ .Config.Image }}' mail` /bin/sh -c "ls -1 etc/opendkim | grep -E 'KeyTable|SigningTable|TrustedHosts|keys'|wc -l"
+    `docker inspect --format '{{ .Config.Image }}' mail` /bin/sh -c "ls -1 /etc/opendkim | grep -E 'KeyTable|SigningTable|TrustedHosts|keys'|wc -l"
   assert_success
   assert_output 4
 }
@@ -662,7 +543,7 @@ load 'test_helper/bats-assert/load'
   # Check presence of tables and TrustedHosts
   run docker run --rm \
     -v "$(pwd)/test/config/without-accounts/opendkim":/etc/opendkim \
-    `docker inspect --format '{{ .Config.Image }}' mail` /bin/sh -c "ls -1 etc/opendkim | grep -E 'KeyTable|SigningTable|TrustedHosts|keys'|wc -l"
+    `docker inspect --format '{{ .Config.Image }}' mail` /bin/sh -c "ls -1 /etc/opendkim | grep -E 'KeyTable|SigningTable|TrustedHosts|keys'|wc -l"
   assert_success
   assert_output 4
 }
@@ -690,7 +571,7 @@ load 'test_helper/bats-assert/load'
   # Check presence of tables and TrustedHosts
   run docker run --rm \
     -v "$(pwd)/test/config/without-virtual/opendkim":/etc/opendkim \
-    `docker inspect --format '{{ .Config.Image }}' mail` /bin/sh -c "ls -1 etc/opendkim | grep -E 'KeyTable|SigningTable|TrustedHosts|keys'|wc -l"
+    `docker inspect --format '{{ .Config.Image }}' mail` /bin/sh -c "ls -1 /etc/opendkim | grep -E 'KeyTable|SigningTable|TrustedHosts|keys'|wc -l"
   assert_success
   assert_output 4
 }
@@ -764,47 +645,6 @@ load 'test_helper/bats-assert/load'
   assert_success
 }
 
-@test "checking ssl: letsencrypt configuration is correct" {
-  run docker exec mail_pop3 /bin/sh -c 'grep -ir "/etc/letsencrypt/live/mail.my-domain.com/" /etc/postfix/main.cf | wc -l'
-  assert_success
-  assert_output 2
-  run docker exec mail_pop3 /bin/sh -c 'grep -ir "/etc/letsencrypt/live/mail.my-domain.com/" /etc/dovecot/conf.d/10-ssl.conf | wc -l'
-  assert_success
-  assert_output 2
-}
-
-@test "checking ssl: letsencrypt cert works correctly" {
-  run docker exec mail_pop3 /bin/sh -c "timeout 1 openssl s_client -connect 0.0.0.0:587 -starttls smtp -CApath /etc/ssl/certs/ | grep 'Verify return code: 10 (certificate has expired)'"
-  assert_success
-}
-
-@test "checking ssl: manual configuration is correct" {
-  run docker exec mail_manual_ssl /bin/sh -c 'grep -ir "/etc/postfix/ssl/cert" /etc/postfix/main.cf | wc -l'
-  assert_success
-  assert_output 1
-  run docker exec mail_manual_ssl /bin/sh -c 'grep -ir "/etc/postfix/ssl/cert" /etc/dovecot/conf.d/10-ssl.conf | wc -l'
-  assert_success
-  assert_output 1
-  run docker exec mail_manual_ssl /bin/sh -c 'grep -ir "/etc/postfix/ssl/key" /etc/postfix/main.cf | wc -l'
-  assert_success
-  assert_output 1
-  run docker exec mail_manual_ssl /bin/sh -c 'grep -ir "/etc/postfix/ssl/key" /etc/dovecot/conf.d/10-ssl.conf | wc -l'
-  assert_success
-  assert_output 1
-}
-
-@test "checking ssl: manual configuration copied files correctly " {
-  run docker exec mail_manual_ssl /bin/sh -c 'cmp -s /etc/postfix/ssl/cert /tmp/docker-mailserver/letsencrypt/mail.my-domain.com/fullchain.pem'
-  assert_success
-  run docker exec mail_manual_ssl /bin/sh -c 'cmp -s /etc/postfix/ssl/key /tmp/docker-mailserver/letsencrypt/mail.my-domain.com/privkey.pem'
-  assert_success
-}
-
-@test "checking ssl: manual cert works correctly" {
-  run docker exec mail_manual_ssl /bin/sh -c "timeout 1 openssl s_client -connect 0.0.0.0:587 -starttls smtp -CApath /etc/ssl/certs/ | grep 'Verify return code: 10 (certificate has expired)'"
-  assert_success
-}
-
 #
 # postsrsd
 #
@@ -841,130 +681,6 @@ load 'test_helper/bats-assert/load'
 }
 @test "checking SRS: fallback to hostname is handled correctly" {
   run docker exec mail grep "SRS_DOMAIN=my-domain.com" /etc/default/postsrsd
-  assert_success
-}
-
-#
-# fail2ban
-#
-
-@test "checking fail2ban: localhost is not banned because ignored" {
-  run docker exec mail_fail2ban /bin/sh -c "fail2ban-client status postfix-sasl | grep 'IP list:.*127.0.0.1'"
-  assert_failure
-  run docker exec mail_fail2ban /bin/sh -c "grep 'ignoreip = 127.0.0.1/8' /etc/fail2ban/jail.conf"
-  assert_success
-}
-
-@test "checking fail2ban: fail2ban-fail2ban.cf overrides" {
-  run docker exec mail_fail2ban /bin/sh -c "fail2ban-client get loglevel | grep DEBUG"
-  assert_success
-}
-
-@test "checking fail2ban: fail2ban-jail.cf overrides" {
-  FILTERS=(sshd postfix dovecot postfix-sasl)
-
-  for FILTER in "${FILTERS[@]}"; do
-    run docker exec mail_fail2ban /bin/sh -c "fail2ban-client get $FILTER bantime"
-    assert_output 1234
-
-    run docker exec mail_fail2ban /bin/sh -c "fail2ban-client get $FILTER findtime"
-    assert_output 321
-
-    run docker exec mail_fail2ban /bin/sh -c "fail2ban-client get $FILTER maxretry"
-    assert_output 2
-  done
-}
-
-@test "checking fail2ban: ban ip on multiple failed login" {
-  # Getting mail_fail2ban container IP
-  MAIL_FAIL2BAN_IP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' mail_fail2ban)
-
-  # Create a container which will send wrong authentications and should get banned
-  docker run --name fail-auth-mailer -e MAIL_FAIL2BAN_IP=$MAIL_FAIL2BAN_IP -v "$(pwd)/test":/tmp/docker-mailserver-test -d $(docker inspect --format '{{ .Config.Image }}' mail) tail -f /var/log/faillog
-
-  # can't pipe the file as usual due to postscreen. (respecting postscreen_greet_wait time and talking in turn):
-  for i in {1,2}; do
-    docker exec fail-auth-mailer /bin/bash -c \
-    'exec 3<>/dev/tcp/$MAIL_FAIL2BAN_IP/25 && \
-    while IFS= read -r cmd; do \
-      head -1 <&3; \
-      [[ "$cmd" == "EHLO"* ]] && sleep 6; \
-      echo $cmd >&3; \
-    done < "/tmp/docker-mailserver-test/auth/smtp-auth-login-wrong.txt"'
-  done
-
-  sleep 5
-
-  # Checking that FAIL_AUTH_MAILER_IP is banned in mail_fail2ban
-  FAIL_AUTH_MAILER_IP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' fail-auth-mailer)
-
-  run docker exec mail_fail2ban /bin/sh -c "fail2ban-client status postfix-sasl | grep '$FAIL_AUTH_MAILER_IP'"
-  assert_success
-
-  # Checking that FAIL_AUTH_MAILER_IP is banned by iptables
-  run docker exec mail_fail2ban /bin/sh -c "iptables -L f2b-postfix-sasl -n | grep REJECT | grep '$FAIL_AUTH_MAILER_IP'"
-  assert_success
-}
-
-@test "checking fail2ban: unban ip works" {
-  FAIL_AUTH_MAILER_IP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' fail-auth-mailer)
-
-  docker exec mail_fail2ban fail2ban-client set postfix-sasl unbanip $FAIL_AUTH_MAILER_IP
-
-  sleep 5
-
-  run docker exec mail_fail2ban /bin/sh -c "fail2ban-client status postfix-sasl | grep 'IP list:.*$FAIL_AUTH_MAILER_IP'"
-  assert_failure
-
-  # Checking that FAIL_AUTH_MAILER_IP is unbanned by iptables
-  run docker exec mail_fail2ban /bin/sh -c "iptables -L f2b-postfix-sasl -n | grep REJECT | grep '$FAIL_AUTH_MAILER_IP'"
-  assert_failure
-}
-
-#
-# postscreen
-#
-
-@test "checking postscreen" {
-  # Getting mail container IP
-  MAIL_POSTSCREEN_IP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' mail_postscreen)
-
-  # talk too fast:
-
-  docker exec fail-auth-mailer /bin/sh -c "nc $MAIL_POSTSCREEN_IP 25 < /tmp/docker-mailserver-test/auth/smtp-auth-login.txt"
-  sleep 5
-
-  run docker exec mail_postscreen grep 'COMMAND PIPELINING' /var/log/mail/mail.log
-  assert_success
-
-  # positive test. (respecting postscreen_greet_wait time and talking in turn):
-  for i in {1,2}; do
-    docker exec fail-auth-mailer /bin/bash -c \
-    'exec 3<>/dev/tcp/'$MAIL_POSTSCREEN_IP'/25 && \
-    while IFS= read -r cmd; do \
-      head -1 <&3; \
-      [[ "$cmd" == "EHLO"* ]] && sleep 6; \
-      echo $cmd >&3; \
-    done < "/tmp/docker-mailserver-test/auth/smtp-auth-login.txt"'
-  done
-
-  sleep 5
-
-  run docker exec mail_postscreen grep 'PASS NEW ' /var/log/mail/mail.log
-  assert_success
-}
-
-#
-# fetchmail
-#
-
-@test "checking fetchmail: gerneral options in fetchmailrc are loaded" {
-  run docker exec mail_fetchmail grep 'set syslog' /etc/fetchmailrc
-  assert_success
-}
-
-@test "checking fetchmail: fetchmail.cf is loaded" {
-  run docker exec mail_fetchmail grep 'pop3.example.com' /etc/fetchmailrc
   assert_success
 }
 
@@ -1020,10 +736,6 @@ load 'test_helper/bats-assert/load'
   assert_failure
   run docker exec mail grep -i 'connect to 127.0.0.1:10023: Connection refused' /var/log/mail/mail.log
   assert_failure
-  run docker exec mail_pop3 grep 'non-null host address bits in' /var/log/mail/mail.log
-  assert_failure
-  run docker exec mail_pop3 grep ': error:' /var/log/mail/mail.log
-  assert_failure
 }
 
 @test "checking system: /var/log/auth.log is error free" {
@@ -1068,11 +780,6 @@ load 'test_helper/bats-assert/load'
 @test "checking manage sieve: server is ready when ENABLE_MANAGESIEVE has been set" {
   run docker exec mail /bin/bash -c "nc -z 0.0.0.0 4190"
   assert_success
-}
-
-@test "checking manage sieve: disabled per default" {
-  run docker exec mail_pop3 /bin/bash -c "nc -z 0.0.0.0 4190"
-  assert_failure
 }
 
 @test "checking sieve: user2 should have piped 1 email to /tmp/" {
@@ -1186,17 +893,8 @@ load 'test_helper/bats-assert/load'
   assert_success
 }
 
-@test "checking PERMIT_DOCKER: opendmarc/opendkim config" {
-  run docker exec mail_smtponly /bin/sh -c "cat /etc/opendmarc/ignore.hosts | grep '172.16.0.0/12'"
-  assert_success
-  run docker exec mail_smtponly /bin/sh -c "cat /etc/opendkim/TrustedHosts | grep '172.16.0.0/12'"
-  assert_success
-}
-
 @test "checking PERMIT_DOCKER: my network value" {
   run docker exec mail /bin/sh -c "postconf | grep '^mynetworks =' | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.0\.0/16'"
-  assert_success
-  run docker exec mail_pop3 /bin/sh -c "postconf | grep '^mynetworks =' | egrep '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}/32'"
   assert_success
 }
 
@@ -1212,8 +910,8 @@ load 'test_helper/bats-assert/load'
 
 
 @test "checking user login: predefined user can login" {
-  result=$(docker exec mail doveadm auth test -x service=smtp pass@localhost.localdomain 'may be \a `p^a.*ssword' | grep 'auth succeeded')
-  [ "$result" = "passdb: pass@localhost.localdomain auth succeeded" ]
+  run docker exec mail /bin/bash -c "doveadm auth test -x service=smtp pass@localhost.localdomain 'may be \\a \`p^a.*ssword' | grep 'passdb'"
+  assert_output "passdb: pass@localhost.localdomain auth succeeded"
 }
 
 #
@@ -1234,14 +932,37 @@ load 'test_helper/bats-assert/load'
 }
 
 # email
-@test "checking setup.sh: setup.sh email add" {
+@test "checking setup.sh: setup.sh email add and login" {
+  wait_for_service mail changedetector
+  assert_success
+
+  originalChangesProcessed=$(count_processed_changes mail)
+
   run ./setup.sh -c mail email add setup_email_add@example.com test_password
   assert_success
 
   value=$(cat ./test/config/postfix-accounts.cf | grep setup_email_add@example.com | awk -F '|' '{print $1}')
   [ "$value" = "setup_email_add@example.com" ]
+  assert_success
 
-  # we test the login of this user later to let the container digest the addition
+  # wait until change detector has processed the change
+  count=0
+  while [ "${originalChangesProcessed}" = "$(count_processed_changes mail)" ]
+  do
+    ((count++)) && ((count==60)) && break
+    sleep 1
+  done
+
+  [ "${originalChangesProcessed}" != "$(count_processed_changes mail)" ]
+  assert_success
+
+  # Dovecot has been restarted, but this test often fails so presumably it may not be ready
+  # Add a short sleep to see if that helps to make the test more stable
+  # Alternatively we could login with a known good user to make sure that the service is up
+  sleep 2
+
+  run docker exec mail /bin/bash -c "doveadm auth test -x service=smtp setup_email_add@example.com 'test_password' | grep 'passdb'"
+  assert_output "passdb: setup_email_add@example.com auth succeeded"
 }
 
 @test "checking setup.sh: setup.sh email list" {
@@ -1250,9 +971,20 @@ load 'test_helper/bats-assert/load'
 }
 
 @test "checking setup.sh: setup.sh email update" {
-  ./setup.sh -c mail email add lorem@impsum.org test_test && initialpass=$(cat ./test/config/postfix-accounts.cf | grep lorem@impsum.org | awk -F '|' '{print $2}')
+  run ./setup.sh -c mail email add lorem@impsum.org test_test
+  assert_success
+
+  initialpass=$(cat ./test/config/postfix-accounts.cf | grep lorem@impsum.org | awk -F '|' '{print $2}')
+  [ "$initialpass" != "" ]
+  assert_success
+
   run ./setup.sh -c mail email update lorem@impsum.org my password
+  assert_success
+
   updatepass=$(cat ./test/config/postfix-accounts.cf | grep lorem@impsum.org | awk -F '|' '{print $2}')
+  [ "$updatepass" != "" ]
+  assert_success
+
   [ "$initialpass" != "$updatepass" ]
   assert_success
 
@@ -1365,21 +1097,6 @@ load 'test_helper/bats-assert/load'
   run ./setup.sh -c mail debug login ls
   assert_success
 }
-@test "checking setup.sh: setup.sh debug fail2ban" {
-
-  run docker exec mail_fail2ban /bin/sh -c "fail2ban-client set dovecot banip 192.0.66.4"
-  run docker exec mail_fail2ban /bin/sh -c "fail2ban-client set dovecot banip 192.0.66.5"
-  sleep 10
-  run ./setup.sh -c mail_fail2ban debug fail2ban
-  assert_output --regexp "^Banned in dovecot: 192.0.66.5 192.0.66.4.*"
-  run ./setup.sh -c mail_fail2ban debug fail2ban unban 192.0.66.4
-  assert_output --partial "unbanned IP from dovecot: 192.0.66.4"
-  run ./setup.sh -c mail_fail2ban debug fail2ban
-  assert_output --regexp "^Banned in dovecot: 192.0.66.5.*"
-  run ./setup.sh -c mail_fail2ban debug fail2ban unban 192.0.66.5
-  run ./setup.sh -c mail_fail2ban debug fail2ban unban
-  assert_output --partial "You need to specify an IP address. Run"
-}
 
 @test "checking setup.sh: setup.sh relay add-domain" {
   mkdir -p ./test/relay/config && echo -n > ./test/relay/config/postfix-relaymap.cf
@@ -1421,130 +1138,14 @@ load 'test_helper/bats-assert/load'
   assert_success
 }
 
-@test "checking setup.sh: email add login validation" {
-  # validates that the user created previously with setup.sh can login
-  result=$(docker exec mail doveadm auth test -x service=smtp setup_email_add@example.com 'test_password' | grep 'auth succeeded')
-  [ "$result" = "passdb: setup_email_add@example.com auth succeeded" ]
-}
-
 #
 # LDAP
 #
 
 # postfix
-@test "checking postfix: ldap lookup works correctly" {
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q some.user@localhost.localdomain ldap:/etc/postfix/ldap-users.cf"
-  assert_success
-  assert_output "some.user@localhost.localdomain"
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q postmaster@localhost.localdomain ldap:/etc/postfix/ldap-aliases.cf"
-  assert_success
-  assert_output "some.user@localhost.localdomain"
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q employees@localhost.localdomain ldap:/etc/postfix/ldap-groups.cf"
-  assert_success
-  assert_output "some.user@localhost.localdomain"
-
-  # Test of the user part of the domain is not the same as the uniqueIdentifier part in the ldap
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q some.user.email@localhost.localdomain ldap:/etc/postfix/ldap-users.cf"
-  assert_success
-  assert_output "some.user.email@localhost.localdomain"
-
-  # Test email receiving from a other domain then the primary domain of the mailserver
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q some.other.user@localhost.otherdomain ldap:/etc/postfix/ldap-users.cf"
-  assert_success
-  assert_output "some.other.user@localhost.otherdomain"
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q postmaster@localhost.otherdomain ldap:/etc/postfix/ldap-aliases.cf"
-  assert_success
-  assert_output "some.other.user@localhost.otherdomain"
-  run docker exec mail_with_ldap /bin/sh -c "postmap -q employees@localhost.otherdomain ldap:/etc/postfix/ldap-groups.cf"
-  assert_success
-  assert_output "some.other.user@localhost.otherdomain"
-}
-
-@test "checking postfix: ldap custom config files copied" {
- run docker exec mail_with_ldap /bin/sh -c "grep '# Testconfig for ldap integration' /etc/postfix/ldap-users.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep '# Testconfig for ldap integration' /etc/postfix/ldap-groups.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep '# Testconfig for ldap integration' /etc/postfix/ldap-aliases.cf"
- assert_success
-}
-
-@test "checking postfix: ldap config overwrites success" {
- run docker exec mail_with_ldap /bin/sh -c "grep 'server_host = ldap' /etc/postfix/ldap-users.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'start_tls = no' /etc/postfix/ldap-users.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'search_base = ou=people,dc=localhost,dc=localdomain' /etc/postfix/ldap-users.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'bind_dn = cn=admin,dc=localhost,dc=localdomain' /etc/postfix/ldap-users.cf"
- assert_success
-
- run docker exec mail_with_ldap /bin/sh -c "grep 'server_host = ldap' /etc/postfix/ldap-groups.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'start_tls = no' /etc/postfix/ldap-groups.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'search_base = ou=people,dc=localhost,dc=localdomain' /etc/postfix/ldap-groups.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'bind_dn = cn=admin,dc=localhost,dc=localdomain' /etc/postfix/ldap-groups.cf"
- assert_success
-
- run docker exec mail_with_ldap /bin/sh -c "grep 'server_host = ldap' /etc/postfix/ldap-aliases.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'start_tls = no' /etc/postfix/ldap-aliases.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'search_base = ou=people,dc=localhost,dc=localdomain' /etc/postfix/ldap-aliases.cf"
- assert_success
- run docker exec mail_with_ldap /bin/sh -c "grep 'bind_dn = cn=admin,dc=localhost,dc=localdomain' /etc/postfix/ldap-aliases.cf"
- assert_success
-}
-
-@test "checking postfix: remove privacy details of the sender" {
-  run docker exec mail_privacy /bin/sh -c "ls /var/mail/localhost.localdomain/user1/new | wc -l"
-  assert_success
-  assert_output 1
-  run docker exec mail_privacy /bin/sh -c "grep -rE "^User-Agent:" /var/mail/localhost.localdomain/user1/new | wc -l"
-  assert_success
-  assert_output 0
-}
-
-# dovecot
-@test "checking dovecot: ldap imap connection and authentication works" {
-  run docker exec mail_with_ldap /bin/sh -c "nc -w 1 0.0.0.0 143 < /tmp/docker-mailserver-test/auth/imap-ldap-auth.txt"
-  assert_success
-}
-
-@test "checking dovecot: ldap mail delivery works" {
-  run docker exec mail_with_ldap /bin/sh -c "sendmail -f user@external.tld some.user@localhost.localdomain < /tmp/docker-mailserver-test/email-templates/test-email.txt"
-  sleep 10
-  run docker exec mail_with_ldap /bin/sh -c "ls -A /var/mail/localhost.localdomain/some.user/new | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking dovecot: ldap mail delivery works for a different domain then the mailserver" {
-  run docker exec mail_with_ldap /bin/sh -c "sendmail -f user@external.tld some.other.user@localhost.otherdomain < /tmp/docker-mailserver-test/email-templates/test-email.txt"
-  sleep 10
-  run docker exec mail_with_ldap /bin/sh -c "ls -A /var/mail/localhost.localdomain/some.other.user/new | wc -l"
-  assert_success
-  assert_output 1
-}
-
-@test "checking dovecot: ldap config overwrites success" {
-  run docker exec mail_with_ldap /bin/sh -c "grep 'hosts = ldap' /etc/dovecot/dovecot-ldap.conf.ext"
-  assert_success
-  run docker exec mail_with_ldap /bin/sh -c "grep 'tls = no' /etc/dovecot/dovecot-ldap.conf.ext"
-  assert_success
-  run docker exec mail_with_ldap /bin/sh -c "grep 'base = ou=people,dc=localhost,dc=localdomain' /etc/dovecot/dovecot-ldap.conf.ext"
-  assert_success
-  run docker exec mail_with_ldap /bin/sh -c "grep 'dn = cn=admin,dc=localhost,dc=localdomain' /etc/dovecot/dovecot-ldap.conf.ext"
-  assert_success
-}
 
 @test "checking dovecot: postmaster address" {
   run docker exec mail /bin/sh -c "grep 'postmaster_address = postmaster@my-domain.com' /etc/dovecot/conf.d/15-lda.conf"
-  assert_success
-
-  run docker exec mail_with_ldap /bin/sh -c "grep 'postmaster_address = postmaster@localhost.localdomain' /etc/dovecot/conf.d/15-lda.conf"
   assert_success
 
   run docker exec mail_override_hostname /bin/sh -c "grep 'postmaster_address = postmaster@my-domain.com' /etc/dovecot/conf.d/15-lda.conf"
@@ -1555,69 +1156,12 @@ load 'test_helper/bats-assert/load'
   # checking rejection of spoofed sender
   run docker exec mail /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/auth/added-smtp-auth-spoofed.txt | grep 'Sender address rejected: not owned by user'"
   assert_success
-  # checking ldap
-  run docker exec mail_with_ldap /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/auth/ldap-smtp-auth-spoofed.txt | grep 'Sender address rejected: not owned by user'"
-  assert_success
 }
 
 @test "checking spoofing: accepts sending as alias" {
 
   run docker exec mail /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/auth/added-smtp-auth-spoofed-alias.txt | grep 'End data with'"
   assert_success
-  # checking ldap alias
-  run docker exec mail_with_ldap /bin/sh -c "nc 0.0.0.0 25 < /tmp/docker-mailserver-test/auth/ldap-smtp-auth-spoofed-alias.txt | grep 'End data with'"
-  assert_success
-}
-
-# saslauthd
-@test "checking saslauthd: sasl ldap authentication works" {
-  run docker exec mail_with_ldap bash -c "testsaslauthd -u some.user -p secret"
-  assert_success
-}
-
-@test "checking saslauthd: ldap smtp authentication" {
-  run docker exec mail_with_ldap /bin/sh -c "nc -w 5 0.0.0.0 25 < /tmp/docker-mailserver-test/auth/sasl-ldap-smtp-auth.txt | grep 'Authentication successful'"
-  assert_success
-  run docker exec mail_with_ldap /bin/sh -c "openssl s_client -quiet -connect 0.0.0.0:465 < /tmp/docker-mailserver-test/auth/sasl-ldap-smtp-auth.txt | grep 'Authentication successful'"
-  assert_success
-  run docker exec mail_with_ldap /bin/sh -c "openssl s_client -quiet -starttls smtp -connect 0.0.0.0:587 < /tmp/docker-mailserver-test/auth/sasl-ldap-smtp-auth.txt | grep 'Authentication successful'"
-  assert_success
-}
-
-
-#
-# RIMAP
-#
-
-# dovecot
-@test "checking dovecot: ldap rimap connection and authentication works" {
-  run docker exec mail_with_imap /bin/sh -c "nc -w 1 0.0.0.0 143 < /tmp/docker-mailserver-test/auth/imap-auth.txt"
-  assert_success
-}
-
-# saslauthd
-@test "checking saslauthd: sasl rimap authentication works" {
-  run docker exec mail_with_imap bash -c "testsaslauthd -u user1@localhost.localdomain -p mypassword"
-  assert_success
-}
-
-@test "checking saslauthd: rimap smtp authentication" {
-  run docker exec mail_with_imap /bin/sh -c "nc -w 5 0.0.0.0 25 < /tmp/docker-mailserver-test/auth/smtp-auth-login.txt | grep 'Authentication successful'"
-  assert_success
-}
-
-#
-# Postfix VIRTUAL_TRANSPORT
-#
-@test "checking postfix-lmtp: virtual_transport config is set" {
-  run docker exec mail_lmtp_ip /bin/sh -c "grep 'virtual_transport = lmtp:127.0.0.1:24' /etc/postfix/main.cf"
-  assert_success
-}
-
-@test "checking postfix-lmtp: delivers mail to existing account" {
-  run docker exec mail_lmtp_ip /bin/sh -c "grep 'postfix/lmtp' /var/log/mail/mail.log | grep 'status=sent' | grep ' Saved)' | wc -l"
-  assert_success
-  assert_output 1
 }
 
 #
@@ -1636,13 +1180,6 @@ load 'test_helper/bats-assert/load'
   # check sender is not the default one.
   run docker exec mail grep "From: mailserver-report@mail.my-domain.com" /var/mail/localhost.localdomain/user1/new/ -R
   assert_failure
-  
-  # checking default sender is correctly set when env variable not defined
-  run docker exec mail_with_ldap grep "mailserver-report@mail.my-domain.com" /etc/logrotate.d/maillog
-  assert_success
-  # checking default logrotation setup
-  run docker exec mail_with_ldap grep "daily" /etc/logrotate.d/maillog
-  assert_success
 }
 
 
@@ -1728,62 +1265,9 @@ load 'test_helper/bats-assert/load'
   assert_success
 }
 
-@test "checking restart of process: fail2ban (fail2ban server enabled)" {
-  run docker exec mail_fail2ban /bin/bash -c "pkill fail2ban && sleep 10 && ps aux --forest | grep -v grep | grep '/usr/bin/python3 /usr/bin/fail2ban-server'"
-  assert_success
-}
-
-@test "checking restart of process: fetchmail" {
-  run docker exec mail_fetchmail /bin/bash -c "pkill fetchmail && sleep 10 && ps aux --forest | grep -v grep | grep '/usr/bin/fetchmail'"
-  assert_success
-}
-
 @test "checking restart of process: clamav (clamav disabled by ENABLED_CLAMAV=0)" {
   run docker exec mail_disabled_clamav_spamassassin /bin/bash -c "pkill -f clamd && sleep 10 && ps aux --forest | grep -v grep | grep '/usr/sbin/clamd'"
   assert_failure
-}
-
-@test "checking restart of process: saslauthd (saslauthd server enabled)" {
-  run docker exec mail_with_ldap /bin/bash -c "pkill saslauthd && sleep 10 && ps aux --forest | grep -v grep | grep '/usr/sbin/saslauthd'"
-  assert_success
-}
-
-#
-# default relay host
-#
-
-@test "checking default relay host: default relay host is added to main.cf" {
-  run docker exec mail_with_default_relay /bin/sh -c 'grep -e "^relayhost = default.relay.host.invalid:25" /etc/postfix/main.cf | wc -l | grep 1'
-  assert_success
-}
-
-#
-# relay hosts
-#
-
-@test "checking relay hosts: default mapping is added from env vars" {
-  run docker exec mail_with_relays /bin/sh -c 'cat /etc/postfix/relayhost_map | grep -e "^@domainone.tld\s\+\[default.relay.com\]:2525" | wc -l | grep 1'
-  assert_success
-}
-
-@test "checking relay hosts: custom mapping is added from file" {
-  run docker exec mail_with_relays /bin/sh -c 'cat /etc/postfix/relayhost_map | grep -e "^@domaintwo.tld\s\+\[other.relay.com\]:587" | wc -l | grep 1'
-  assert_success
-}
-
-@test "checking relay hosts: ignored domain is not added" {
-  run docker exec mail_with_relays /bin/sh -c 'cat /etc/postfix/relayhost_map | grep -e "^@domainthree.tld\s\+\[any.relay.com\]:25" | wc -l | grep 0'
-  assert_success
-}
-
-@test "checking relay hosts: auth entry is added" {
-  run docker exec mail_with_relays /bin/sh -c 'cat /etc/postfix/sasl_passwd | grep -e "^@domaintwo.tld\s\+smtp_user_2:smtp_password_2" | wc -l | grep 1'
-  assert_success
-}
-
-@test "checking relay hosts: default auth entry is added" {
-  run docker exec mail_with_relays /bin/sh -c 'cat /etc/postfix/sasl_passwd | grep -e "^\[default.relay.com\]:2525\s\+smtp_user:smtp_password" | wc -l | grep 1'
-  assert_success
 }
 
 #

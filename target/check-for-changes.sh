@@ -1,9 +1,7 @@
-#! /bin/bash
+#!/bin/bash
 
 # create date for log output
 log_date=$(date +"%Y-%m-%d %H:%M:%S ")
-# Prevent a start too early
-sleep 5
 echo "${log_date} Start check-for-changes script."
 
 # change directory
@@ -13,17 +11,33 @@ cd /tmp/docker-mailserver
 if [ ! -f postfix-accounts.cf ]; then
    echo "${log_date} postfix-accounts.cf is missing! This should not run! Exit!"
    exit
-fi 
+fi
 
-# create an array of files to monitor (perhaps simple *.cf would be ok here)
+# Verify checksum file exists; must be prepared by start-mailserver.sh
+CHKSUM_FILE=/tmp/docker-mailserver-config-chksum
+if [ ! -f $CHKSUM_FILE ]; then
+   echo "${log_date} ${CHKSUM_FILE} is missing! Start script failed? Exit!"
+   exit
+fi
+
+# Determine postmaster address, duplicated from start-mailserver.sh
+# This script previously didn't work when POSTMASTER_ADDRESS was empty
+if [[ -n "${OVERRIDE_HOSTNAME}" ]]; then
+  DOMAINNAME=$(echo "${OVERRIDE_HOSTNAME}" | sed s/[^.]*.//)
+else
+  DOMAINNAME="$(hostname -d)"
+fi
+PM_ADDRESS="${POSTMASTER_ADDRESS:=postmaster@${DOMAINNAME}}"
+echo "${log_date} Using postmaster address ${PM_ADDRESS}"
+
+# Create an array of files to monitor, must be the same as in start-mailserver.sh
 declare -a cf_files=()
 for file in postfix-accounts.cf postfix-virtual.cf postfix-aliases.cf; do
   [ -f "$file" ] && cf_files+=("$file")
 done
 
-# Update / generate after start
-echo "${log_date} Makeing new checksum file."
-sha512sum ${cf_files[@]/#/--tag } > chksum
+# Wait to make sure server is up before we start
+sleep 10
 
 # Run forever
 while true; do
@@ -31,14 +45,24 @@ while true; do
 # recreate logdate
 log_date=$(date +"%Y-%m-%d %H:%M:%S ")
 
-# Get chksum and check it.
-chksum=$(sha512sum -c --ignore-missing chksum)
+# Get chksum and check it, no need to lock config yet
+chksum=$(sha512sum -c --ignore-missing $CHKSUM_FILE)
 
 if [[ $chksum == *"FAIL"* ]]; then
 	echo "${log_date} Change detected"
 
+	# Bug alert! This overwrites the alias set by start-mailserver.sh
+	# Take care that changes in one script are propagated to the other
+        # Also note that changes are performed in place and are not atomic
+        # We should fix that and write to temporary files, stop, swap and start
+
+        # Lock configuration while working
+        # Not fixing indentation yet to reduce diff (fix later in separate commit)
+        (
+          flock -e 200
+
 	#regen postix aliases.
-	echo "root: ${POSTMASTER_ADDRESS}" > /etc/aliases
+	echo "root: ${PM_ADDRESS}" > /etc/aliases
 	if [ -f /tmp/docker-mailserver/postfix-aliases.cf ]; then
 		cat /tmp/docker-mailserver/postfix-aliases.cf>>/etc/aliases
 	fi
@@ -174,7 +198,9 @@ if [[ $chksum == *"FAIL"* ]]; then
 	fi 
 
 	echo "${log_date} Update checksum"
-	sha512sum ${cf_files[@]/#/--tag } > chksum
+	sha512sum ${cf_files[@]/#/--tag } >$CHKSUM_FILE
+
+        ) 200<postfix-accounts.cf # end lock
 fi
 
 sleep 1
